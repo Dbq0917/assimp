@@ -68,8 +68,7 @@ namespace Assimp {
 /** This post processing step limits the number of bones affecting a vertex
 * to a certain maximum value. If a vertex is affected by more than that number
 * of bones, the bone weight with the least influence on this vertex are removed.
-* The other weights on this bone are then renormalized to assure the sum weight
-* to be 1.
+* The remaining weights are renormalized to assure the sum weight is 1.
 */
 class ASSIMP_API LimitBoneWeightsProcess : public BaseProcess {
 public:

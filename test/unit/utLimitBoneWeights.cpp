@@ -134,3 +134,53 @@ TEST_F(LimitBoneWeightsTest, testProcess) {
 
     // everything seems to be OK
 }
+
+TEST_F(LimitBoneWeightsTest, testProcessNormalizesWeightsBelowLimit) {
+    aiMesh mesh;
+    mesh.mNumVertices = 1;
+    mesh.mVertices = new aiVector3D[1];
+    mesh.mNumBones = 2;
+    mesh.mBones = new aiBone *[2];
+
+    aiBone *bone0 = mesh.mBones[0] = new aiBone();
+    bone0->mNumWeights = 1;
+    bone0->mWeights = new aiVertexWeight[1];
+    bone0->mWeights[0] = aiVertexWeight(0, 0.2f);
+
+    aiBone *bone1 = mesh.mBones[1] = new aiBone();
+    bone1->mNumWeights = 1;
+    bone1->mWeights = new aiVertexWeight[1];
+    bone1->mWeights[0] = aiVertexWeight(0, 0.3f);
+
+    mProcess->ProcessMesh(&mesh);
+
+    ASSERT_EQ(2u, mesh.mNumBones);
+    EXPECT_NEAR(0.4f, mesh.mBones[0]->mWeights[0].mWeight, 0.0001f);
+    EXPECT_NEAR(0.6f, mesh.mBones[1]->mWeights[0].mWeight, 0.0001f);
+}
+
+TEST_F(LimitBoneWeightsTest, testProcessNormalizesWeightsAboveLimit) {
+    aiMesh mesh;
+    mesh.mNumVertices = 1;
+    mesh.mVertices = new aiVector3D[1];
+    mesh.mNumBones = 5;
+    mesh.mBones = new aiBone *[5];
+
+    for (unsigned int i = 0; i < mesh.mNumBones; ++i) {
+        aiBone *bone = mesh.mBones[i] = new aiBone();
+        bone->mNumWeights = 1;
+        bone->mWeights = new aiVertexWeight[1];
+        bone->mWeights[0] = aiVertexWeight(0, 0.1f);
+    }
+
+    mProcess->ProcessMesh(&mesh);
+
+    ASSERT_EQ(4u, mesh.mNumBones);
+    float sum = 0.0f;
+    for (unsigned int i = 0; i < mesh.mNumBones; ++i) {
+        ASSERT_EQ(1u, mesh.mBones[i]->mNumWeights);
+        EXPECT_NEAR(0.25f, mesh.mBones[i]->mWeights[0].mWeight, 0.0001f);
+        sum += mesh.mBones[i]->mWeights[0].mWeight;
+    }
+    EXPECT_NEAR(1.0f, sum, 0.0001f);
+}

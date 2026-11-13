@@ -236,8 +236,8 @@ enum aiPostProcessSteps
     *  to a maximum value.
     *
     * If any vertex is affected by more than the maximum number of bones, the least
-    * important vertex weights are removed and the remaining vertex weights are
-    * renormalized so that the weights still sum up to 1.
+    * important vertex weights are removed. In all cases, the vertex weights are
+    * renormalized so that they sum up to 1.
     * The default bone weight limit is 4 (defined as <tt>#AI_LMW_MAX_WEIGHTS</tt> in
     * config.h), but you can use the <tt>#AI_CONFIG_PP_LBW_MAX_WEIGHTS</tt> importer
     * property to supply your own limit to the post processing step.

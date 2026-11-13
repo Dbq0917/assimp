@@ -127,26 +127,39 @@ void LimitBoneWeightsProcess::ProcessMesh(aiMesh* pMesh) {
         }
     }
 
-    if (maxVertexWeights <= mMaxWeights)
-        return;
+    if (maxVertexWeights <= mMaxWeights) {
+        bool needsNormalization = false;
+        for (const VertexWeightArray &weights : vertexWeights) {
+            float sum = 0.0f;
+            for (const Weight &weight : weights) {
+                sum += weight.mWeight;
+            }
+            if (sum != 0.0f && sum != 1.0f) {
+                needsNormalization = true;
+                break;
+            }
+        }
+        if (!needsNormalization) {
+            return;
+        }
+    }
 
     unsigned int removed = 0, old_bones = pMesh->mNumBones;
 
     // now cut the weight count if it exceeds the maximum
     for (WeightsPerVertex::iterator vit = vertexWeights.begin(); vit != vertexWeights.end(); ++vit) {
-        if (vit->size() <= mMaxWeights)
-            continue;
+        if (vit->size() > mMaxWeights) {
+            // more than the defined maximum -> first sort by weight in descending order. That's
+            // why we defined the < operator in such a weird way.
+            std::sort(vit->begin(), vit->end());
 
-        // more than the defined maximum -> first sort by weight in descending order. That's
-        // why we defined the < operator in such a weird way.
-        std::sort(vit->begin(), vit->end());
+            // now kill everything beyond the maximum count
+            unsigned int m = static_cast<unsigned int>(vit->size());
+            vit->resize(mMaxWeights);
+            removed += static_cast<unsigned int>(m - vit->size());
+        }
 
-        // now kill everything beyond the maximum count
-        unsigned int m = static_cast<unsigned int>(vit->size());
-        vit->resize(mMaxWeights);
-        removed += static_cast<unsigned int>(m - vit->size());
-
-        // and renormalize the weights
+        // renormalize the remaining weights
         float sum = 0.0f;
         for(const Weight* it = vit->begin(); it != vit->end(); ++it) {
             sum += it->mWeight;
