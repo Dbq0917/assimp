@@ -50,7 +50,16 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/BaseImporter.h>
 #include <assimp/material.h>
 
+#include <string>
+#include <vector>
+
+struct iqmheader;
+
 namespace Assimp {
+
+struct IQMJointData;
+struct IQMPoseData;
+struct IQMAnimData;
 
 class IQMImporter : public BaseImporter {
 public:
@@ -70,7 +79,12 @@ protected:
     void InternReadFile(const std::string &pFile, aiScene *pScene, IOSystem *pIOHandler) override;
 
 private:
+    //! \brief  Imports joints, bone bindings, animation channels and keyframes.
+    void ImportSkeletonAndAnimations(const std::string &pFile, aiScene *pScene,
+            const unsigned char *data, const iqmheader &hdr);
+
     aiScene *mScene = nullptr; // the scene to import to
+    std::vector<IQMJointData> mJoints; // parsed joints, shared with the bone binding step
 };
 
 } // Namespace Assimp

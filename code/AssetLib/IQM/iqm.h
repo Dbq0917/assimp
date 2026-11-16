@@ -130,5 +130,11 @@ struct iqmextension
     unsigned int ofs_extensions; // pointer to next extension
 };
 
+// Sizes of the on-disk structures, kept explicit so the bounds checks in the
+// importer cannot silently change when the host layout adds padding.
+static const unsigned int IQM_JOINT_V2_SIZE = 48u; // name, parent, translate[3], rotate[4], scale[3]
+static const unsigned int IQM_POSE_V2_SIZE = 88u;  // parent, mask, channeloffset[10], channelscale[10]
+static const unsigned int IQM_ANIM_SIZE = 20u;     // name, first_frame, num_frames, framerate, flags
+
 #endif
 

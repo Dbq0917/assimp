@@ -49,6 +49,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/DefaultLogger.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/ByteSwapper.h>
+#include <assimp/quaternion.h>
+#include <assimp/matrix4x4.h>
 #include <memory>
 #include <numeric>
 
@@ -115,6 +117,428 @@ bool IQMImporter::CanRead(const std::string &pFile, IOSystem *pIOHandler, bool c
 // ------------------------------------------------------------------------------------------------
 const aiImporterDesc *IQMImporter::GetInfo() const {
     return &desc;
+}
+
+// IQM stores ten animation channels per joint pose:
+// 0..2 translation, 3..6 quaternion rotation (x, y, z, w), 7..9 scale.
+constexpr unsigned int IQM_NUM_CHANNELS = 10u;
+constexpr unsigned int IQM_CHANNEL_MASK_ALL = (1u << IQM_NUM_CHANNELS) - 1u;
+
+struct IQMJointData {
+    std::string name;
+    int parent;
+    aiVector3D translation;
+    aiQuaternion rotation;
+    aiVector3D scale;
+    aiNode *node;
+    aiMatrix4x4 localMatrix;
+    aiMatrix4x4 globalMatrix;
+    aiMatrix4x4 inverseGlobalMatrix;
+};
+
+struct IQMPoseData {
+    int parent;
+    unsigned int mask;
+    float channelOffset[IQM_NUM_CHANNELS];
+    float channelScale[IQM_NUM_CHANNELS];
+};
+
+struct IQMAnimData {
+    std::string name;
+    unsigned int firstFrame;
+    unsigned int numFrames;
+    float frameRate;
+    unsigned int flags;
+};
+
+namespace {
+
+aiMatrix4x4 ComposeLocalMatrix(const aiVector3D &translation, const aiQuaternion &rotation,
+        const aiVector3D &scale) {
+    return aiMatrix4x4(scale, rotation, translation);
+}
+
+template <typename T>
+void SwapPod(T &value) {
+    swap_block(reinterpret_cast<uint32_t *>(&value), sizeof(T));
+}
+
+unsigned int PopCount(unsigned int value) {
+    unsigned int count = 0;
+    while (value) {
+        value &= value - 1;
+        ++count;
+    }
+    return count;
+}
+
+// Creates one node per joint, keeps the file's parent indices and names, and
+// stores the parent-local base pose as the node transformation.
+void BuildSkeletonNodes(aiScene *pScene, std::vector<IQMJointData> &joints) {
+    if (joints.empty()) {
+        return;
+    }
+
+    for (IQMJointData &joint : joints) {
+        joint.node = new aiNode();
+        joint.node->mName.Set(joint.name);
+        joint.node->mTransformation = joint.localMatrix;
+    }
+
+    aiNode *root = pScene->mRootNode;
+
+    for (unsigned int jointIndex = 0; jointIndex < joints.size(); ++jointIndex) {
+        aiNode *const node = joints[jointIndex].node;
+        const int parent = joints[jointIndex].parent;
+        aiNode *const parentNode = parent >= 0 ? joints[parent].node : root;
+
+        aiNode **oldChildren = parentNode->mChildren;
+        const unsigned int oldCount = parentNode->mNumChildren;
+        parentNode->mChildren = new aiNode *[oldCount + 1];
+        for (unsigned int childIndex = 0; childIndex < oldCount; ++childIndex) {
+            parentNode->mChildren[childIndex] = oldChildren[childIndex];
+        }
+        parentNode->mChildren[oldCount] = node;
+        parentNode->mNumChildren = oldCount + 1;
+        node->mParent = parentNode;
+        delete[] oldChildren;
+    }
+}
+
+// Turns the BLENDINDEX/BLENDWEIGHT vertex arrays into aiBone bindings. The
+// offset matrix is the inverse of the joint's global base pose. Blend indices
+// address the global IQM vertex table, so each mesh's first_vertex offset is
+// subtracted to obtain the mesh-local vertex id used by aiBone.
+void BuildBoneBindings(aiScene *pScene, const std::vector<IQMJointData> &joints,
+        const unsigned char *blendIndices, const unsigned char *blendWeights,
+        const unsigned int *meshFirstVertex, unsigned int blendComponents,
+        size_t fileSize, unsigned int numVertices, const unsigned char *fileBase) {
+    if (joints.empty() || !blendIndices || !blendWeights || blendComponents == 0) {
+        return;
+    }
+
+    const uint64_t blendBytes = uint64_t(numVertices) * blendComponents;
+    const uint64_t indicesOffset = uint64_t(blendIndices - fileBase);
+    const uint64_t weightsOffset = uint64_t(blendWeights - fileBase);
+    if (blendBytes > fileSize || indicesOffset > fileSize || weightsOffset > fileSize ||
+            blendBytes > fileSize - indicesOffset || blendBytes > fileSize - weightsOffset) {
+        throw DeadlyImportError("IQM-file has blend vertex arrays referencing data outside of the file.");
+    }
+    struct WeightEntry {
+        unsigned int vertexId;
+        float weight;
+    };
+
+    for (unsigned int meshIndex = 0; meshIndex < pScene->mNumMeshes; ++meshIndex) {
+        aiMesh *mesh = pScene->mMeshes[meshIndex];
+        if (!mesh->mNumVertices) {
+            continue;
+        }
+
+        std::vector<std::vector<WeightEntry>> weightsPerJoint(joints.size());
+        const unsigned int firstVertex = meshFirstVertex[meshIndex];
+        for (unsigned int vertex = 0; vertex < mesh->mNumVertices; ++vertex) {
+            const unsigned int globalVertex = firstVertex + vertex;
+            const unsigned char *indices = blendIndices + globalVertex * blendComponents;
+            const unsigned char *weights = blendWeights + globalVertex * blendComponents;
+            for (unsigned int component = 0; component < blendComponents; ++component) {
+                const unsigned int jointIndex = indices[component];
+                const float weight = weights[component] / 255.0f;
+                if (weight == 0.0f) {
+                    continue;
+                }
+                if (jointIndex >= joints.size()) {
+                    throw DeadlyImportError("IQM-file has a blend index outside of the joint table.");
+                }
+                weightsPerJoint[jointIndex].push_back({ vertex, weight });
+            }
+        }
+
+        unsigned int numBones = 0;
+        for (const std::vector<WeightEntry> &entries : weightsPerJoint) {
+            if (!entries.empty()) {
+                ++numBones;
+            }
+        }
+        if (numBones == 0) {
+            continue;
+        }
+
+        mesh->mNumBones = numBones;
+        mesh->mBones = new aiBone *[numBones]();
+        unsigned int boneSlot = 0;
+        for (unsigned int jointIndex = 0; jointIndex < joints.size(); ++jointIndex) {
+            const std::vector<WeightEntry> &entries = weightsPerJoint[jointIndex];
+            if (entries.empty()) {
+                continue;
+            }
+
+            aiBone *bone = mesh->mBones[boneSlot++] = new aiBone();
+            bone->mName.Set(joints[jointIndex].name);
+            bone->mOffsetMatrix = joints[jointIndex].inverseGlobalMatrix;
+            bone->mNumWeights = static_cast<unsigned int>(entries.size());
+            bone->mWeights = new aiVertexWeight[bone->mNumWeights];
+            for (unsigned int weightIndex = 0; weightIndex < bone->mNumWeights; ++weightIndex) {
+                bone->mWeights[weightIndex].mVertexId = entries[weightIndex].vertexId;
+                bone->mWeights[weightIndex].mWeight = entries[weightIndex].weight;
+            }
+        }
+    }
+}
+
+// Decodes the compressed frame table (one unsigned short per enabled pose
+// channel) into assimp animation channels. Key times are expressed in ticks so
+// that mTicksPerSecond equals the file-declared frame rate: one key per frame,
+// at times 0, 1, ..., numFrames-1. No resampling is performed.
+void BuildAnimations(aiScene *pScene, const unsigned char *data, const iqmheader &hdr,
+        const std::vector<IQMJointData> &joints, const std::vector<IQMPoseData> &poses,
+        const std::vector<IQMAnimData> &animations) {
+    pScene->mNumAnimations = static_cast<unsigned int>(animations.size());
+    pScene->mAnimations = new aiAnimation *[pScene->mNumAnimations]();
+
+    const uint16_t *frameTable = reinterpret_cast<const uint16_t *>(data + hdr.ofs_frames);
+
+    for (unsigned int animIndex = 0; animIndex < animations.size(); ++animIndex) {
+        const IQMAnimData &sourceAnim = animations[animIndex];
+        aiAnimation *animation = pScene->mAnimations[animIndex] = new aiAnimation();
+        animation->mName.Set(sourceAnim.name);
+        animation->mTicksPerSecond = sourceAnim.frameRate;
+        animation->mDuration = static_cast<double>(sourceAnim.numFrames - 1);
+
+        animation->mNumChannels = static_cast<unsigned int>(joints.size());
+        animation->mChannels = new aiNodeAnim *[animation->mNumChannels]();
+
+        for (unsigned int jointIndex = 0; jointIndex < joints.size(); ++jointIndex) {
+            aiNodeAnim *channel = animation->mChannels[jointIndex] = new aiNodeAnim();
+            channel->mNodeName.Set(joints[jointIndex].name);
+            channel->mNumPositionKeys = sourceAnim.numFrames;
+            channel->mNumRotationKeys = sourceAnim.numFrames;
+            channel->mNumScalingKeys = sourceAnim.numFrames;
+            channel->mPositionKeys = new aiVectorKey[sourceAnim.numFrames];
+            channel->mRotationKeys = new aiQuatKey[sourceAnim.numFrames];
+            channel->mScalingKeys = new aiVectorKey[sourceAnim.numFrames];
+        }
+
+        const unsigned int numJoints = static_cast<unsigned int>(joints.size());
+        for (unsigned int frameOffset = 0; frameOffset < sourceAnim.numFrames; ++frameOffset) {
+            const unsigned int sourceFrame = sourceAnim.firstFrame + frameOffset;
+            const uint16_t *frameCursor = frameTable + sourceFrame * hdr.num_framechannels;
+            const double keyTime = static_cast<double>(frameOffset);
+
+            for (unsigned int jointIndex = 0; jointIndex < numJoints; ++jointIndex) {
+                const IQMPoseData &pose = poses[jointIndex];
+                float channelValue[IQM_NUM_CHANNELS];
+                for (unsigned int channel = 0; channel < IQM_NUM_CHANNELS; ++channel) {
+                    float value = pose.channelOffset[channel];
+                    if (pose.mask & (1u << channel)) {
+                        uint16_t raw;
+                        memcpy(&raw, frameCursor, sizeof(raw));
+                        AI_SWAP2(raw);
+                        frameCursor++;
+                        value += raw * pose.channelScale[channel];
+                    }
+                    channelValue[channel] = value;
+                }
+
+                aiNodeAnim *channel = animation->mChannels[jointIndex];
+                channel->mPositionKeys[frameOffset].mTime = keyTime;
+                channel->mPositionKeys[frameOffset].mValue =
+                        aiVector3D(channelValue[0], channelValue[1], channelValue[2]);
+
+                aiQuaternion rotation(channelValue[6], channelValue[3], channelValue[4], channelValue[5]);
+                rotation.Normalize();
+                channel->mRotationKeys[frameOffset].mTime = keyTime;
+                channel->mRotationKeys[frameOffset].mValue = rotation;
+
+                channel->mScalingKeys[frameOffset].mTime = keyTime;
+                channel->mScalingKeys[frameOffset].mValue =
+                        aiVector3D(channelValue[7], channelValue[8], channelValue[9]);
+            }
+        }
+    }
+}
+
+} // namespace
+
+// ------------------------------------------------------------------------------------------------
+// Builds the joint hierarchy as scene nodes, the per-mesh bone bindings and
+// the animation channels/keyframes declared by the file.
+void IQMImporter::ImportSkeletonAndAnimations(const std::string &file, aiScene *pScene,
+        const unsigned char *data, const iqmheader &hdr) {
+    const auto fail = [&file](const char *message) {
+        throw DeadlyImportError("IQM-file ", file, " ", message);
+    };
+
+    const auto rangeInFile = [fileSize = size_t(hdr.filesize)](uint64_t offset, uint64_t bytes) {
+        return bytes <= fileSize && offset <= fileSize - bytes;
+    };
+
+    if (hdr.num_joints > 0 && !rangeInFile(hdr.ofs_joints, uint64_t(hdr.num_joints) * IQM_JOINT_V2_SIZE)) {
+        fail("references joints outside of the file");
+    }
+    if (hdr.num_poses > 0 && !rangeInFile(hdr.ofs_poses, uint64_t(hdr.num_poses) * IQM_POSE_V2_SIZE)) {
+        fail("references poses outside of the file");
+    }
+    if (hdr.num_anims > 0 && !rangeInFile(hdr.ofs_anims, uint64_t(hdr.num_anims) * IQM_ANIM_SIZE)) {
+        fail("references animations outside of the file");
+    }
+    const uint64_t frameBytes = uint64_t(hdr.num_frames) * hdr.num_framechannels * sizeof(uint16_t);
+    if (frameBytes > 0 && !rangeInFile(hdr.ofs_frames, frameBytes)) {
+        fail("references frame data outside of the file");
+    }
+
+    const char *textBlock = hdr.num_text ? reinterpret_cast<const char *>(data + hdr.ofs_text) : "";
+    const auto readString = [&](unsigned int offset) -> std::string {
+        if (offset >= hdr.num_text) {
+            fail("references a name outside of the text block");
+        }
+        return std::string(textBlock + offset);
+    };
+
+    if (hdr.num_poses != 0 && hdr.num_poses != hdr.num_joints) {
+        fail("does not provide one pose per joint");
+    }
+    if ((hdr.num_anims != 0 || hdr.num_frames != 0) && hdr.num_poses != hdr.num_joints) {
+        fail("contains animation data but no matching joint poses");
+    }
+
+    std::vector<IQMJointData> joints;
+    joints.reserve(hdr.num_joints);
+
+    for (unsigned int jointIndex = 0; jointIndex < hdr.num_joints; ++jointIndex) {
+        iqmjoint joint;
+        memcpy(&joint, data + hdr.ofs_joints + jointIndex * IQM_JOINT_V2_SIZE, sizeof(joint));
+        SwapPod(joint.name);
+        AI_SWAP4(joint.parent);
+        for (float &component : joint.translate) {
+            (void)component;
+            AI_SWAP4(component);
+        }
+        for (float &component : joint.rotate) {
+            (void)component;
+            AI_SWAP4(component);
+        }
+        for (float &component : joint.scale) {
+            (void)component;
+            AI_SWAP4(component);
+        }
+
+        if (joint.parent >= int(hdr.num_joints)) {
+            fail("has a joint with an invalid parent index");
+        }
+
+        IQMJointData parsed;
+        parsed.name = readString(joint.name);
+        parsed.parent = joint.parent;
+        parsed.translation = aiVector3D(joint.translate[0], joint.translate[1], joint.translate[2]);
+        parsed.rotation = aiQuaternion(joint.rotate[3], joint.rotate[0], joint.rotate[1], joint.rotate[2]);
+        parsed.rotation.Normalize();
+        parsed.scale = aiVector3D(joint.scale[0], joint.scale[1], joint.scale[2]);
+        parsed.node = nullptr;
+        parsed.localMatrix = ComposeLocalMatrix(parsed.translation, parsed.rotation, parsed.scale);
+        joints.push_back(parsed);
+    }
+
+    // The base pose is given in parent-local space; accumulate the global
+    // transforms and their inverses, the latter being the bone offset matrices.
+    for (unsigned int jointIndex = 0; jointIndex < hdr.num_joints; ++jointIndex) {
+        IQMJointData &joint = joints[jointIndex];
+        if (joint.parent >= 0) {
+            joint.globalMatrix = joints[joint.parent].globalMatrix * joint.localMatrix;
+        } else {
+            joint.globalMatrix = joint.localMatrix;
+        }
+        joint.inverseGlobalMatrix = joint.globalMatrix;
+        joint.inverseGlobalMatrix.Inverse();
+        // The inverse of an affine TRS matrix is affine as well, so its fourth
+        // row is exactly (0, 0, 0, 1). Pin it to remove the floating point drift
+        // produced by the generic matrix inversion (keeps glTF/skinning consumers
+        // such as the preview pipeline happy).
+        joint.inverseGlobalMatrix.d1 = 0.0f;
+        joint.inverseGlobalMatrix.d2 = 0.0f;
+        joint.inverseGlobalMatrix.d3 = 0.0f;
+        joint.inverseGlobalMatrix.d4 = 1.0f;
+    }
+
+    std::vector<IQMPoseData> poses;
+    poses.reserve(hdr.num_poses);
+    for (unsigned int poseIndex = 0; poseIndex < hdr.num_poses; ++poseIndex) {
+        iqmpose pose;
+        memcpy(&pose, data + hdr.ofs_poses + poseIndex * IQM_POSE_V2_SIZE, sizeof(pose));
+        AI_SWAP4(pose.parent);
+        AI_SWAP4(pose.mask);
+        for (float &component : pose.channeloffset) {
+            (void)component;
+            AI_SWAP4(component);
+        }
+        for (float &component : pose.channelscale) {
+            (void)component;
+            AI_SWAP4(component);
+        }
+
+        if (pose.parent >= int(hdr.num_joints)) {
+            fail("has a pose with an invalid parent index");
+        }
+        if (pose.mask & ~IQM_CHANNEL_MASK_ALL) {
+            fail("uses an unsupported animation channel");
+        }
+
+        IQMPoseData parsed;
+        parsed.parent = pose.parent;
+        parsed.mask = pose.mask;
+        memcpy(parsed.channelOffset, pose.channeloffset, sizeof(parsed.channelOffset));
+        memcpy(parsed.channelScale, pose.channelscale, sizeof(parsed.channelScale));
+        poses.push_back(parsed);
+    }
+
+    std::vector<IQMAnimData> animations;
+    animations.reserve(hdr.num_anims);
+    for (unsigned int animIndex = 0; animIndex < hdr.num_anims; ++animIndex) {
+        iqmanim anim;
+        memcpy(&anim, data + hdr.ofs_anims + animIndex * IQM_ANIM_SIZE, sizeof(anim));
+        SwapPod(anim.name);
+        SwapPod(anim.first_frame);
+        SwapPod(anim.num_frames);
+        AI_SWAP4(anim.framerate);
+        SwapPod(anim.flags);
+
+        if (anim.framerate <= 0.0f) {
+            fail("declares an animation with a non-positive frame rate");
+        }
+        const uint64_t lastFrame = uint64_t(anim.first_frame) + anim.num_frames;
+        if (anim.num_frames == 0 || lastFrame > hdr.num_frames) {
+            fail("references animation frames outside of the frame table");
+        }
+
+        IQMAnimData parsed;
+        parsed.name = readString(anim.name);
+        parsed.firstFrame = anim.first_frame;
+        parsed.numFrames = anim.num_frames;
+        parsed.frameRate = anim.framerate;
+        parsed.flags = anim.flags;
+        animations.push_back(parsed);
+    }
+
+    // Cross-check the frame table against the pose masks: the file must contain
+    // exactly one unsigned short per enabled channel per frame.
+    if (hdr.num_frames > 0) {
+        unsigned int channelsPerFrame = 0;
+        for (const IQMPoseData &pose : poses) {
+            channelsPerFrame += PopCount(pose.mask);
+        }
+        if (hdr.num_framechannels != channelsPerFrame) {
+            fail("has a frame channel count that does not match the pose masks");
+        }
+    }
+
+    BuildSkeletonNodes(pScene, joints);
+    if (!animations.empty()) {
+        BuildAnimations(pScene, data, hdr, joints, poses, animations);
+    }
+
+    // Hand the parsed base poses back to the main import routine so it can
+    // attach bone bindings once the blend vertex arrays have been read.
+    mJoints = std::move(joints);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -227,10 +651,21 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
     pScene->mNumMaterials = 0;
     pScene->mMaterials = new aiMaterial *[hdr.num_meshes]();
 
+    // Blend vertex arrays are file-global; remember them while the meshes are
+    // parsed so the bone bindings can be built afterwards.
+    const unsigned char *blendIndices = nullptr;
+    const unsigned char *blendWeights = nullptr;
+    unsigned int blendComponents = 0;
+    std::vector<unsigned int> meshFirstVertex(hdr.num_meshes);
+
     // Swap vertex arrays beforehand...
     for( auto array = reinterpret_cast<iqmvertexarray*>( data + hdr.ofs_vertexarrays ), end = array + hdr.num_vertexarrays; array != end; ++array ) {
         swap_block( &array->type, sizeof( iqmvertexarray ) );
     }
+
+    // Build the joint hierarchy, base pose nodes and animation channels. Bone
+    // bindings are attached below once the blend vertex arrays have been read.
+    ImportSkeletonAndAnimations(file, pScene, data, hdr);
 
     // Read all surfaces from the file
     for( auto imesh = reinterpret_cast<iqmmesh*>( data + hdr.ofs_meshes ), end_ = imesh + hdr.num_meshes; imesh != end_; ++imesh ) {
@@ -245,6 +680,7 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         // Allocate output mesh & material
         auto mesh = pScene->mMeshes[pScene->mNumMeshes++] = new aiMesh();
         mesh->mMaterialIndex = pScene->mNumMaterials;
+        meshFirstVertex[pScene->mNumMeshes - 1] = imesh->first_vertex;
         auto mat = pScene->mMaterials[pScene->mNumMaterials++] = new aiMaterial();
         {
             auto text = reinterpret_cast<char*>( data + hdr.ofs_text );
@@ -366,16 +802,37 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
                 }
 #endif
                 break;
-            case IQM_BLENDINDEXES:
-            case IQM_BLENDWEIGHTS:
             case IQM_CUSTOM:
                 break; // these attributes are not relevant.
+            case IQM_BLENDINDEXES:
+                if (array->format == IQM_UBYTE) {
+                    if (blendComponents == 0) {
+                        blendComponents = step;
+                    } else if (blendComponents != step) {
+                        throw DeadlyImportError("IQM-file ", file, " has mismatched blend index/weight component counts.");
+                    }
+                    blendIndices = data + array->offset;
+                }
+                break;
+            case IQM_BLENDWEIGHTS:
+                if (array->format == IQM_UBYTE) {
+                    if (blendComponents == 0) {
+                        blendComponents = step;
+                    } else if (blendComponents != step) {
+                        throw DeadlyImportError("IQM-file ", file, " has mismatched blend index/weight component counts.");
+                    }
+                    blendWeights = data + array->offset;
+                }
+                break;
 
             default:
                 break;
             }
         }
     }
+
+    BuildBoneBindings(pScene, mJoints, blendIndices, blendWeights, meshFirstVertex.data(),
+            blendComponents, fileSize, hdr.num_vertexes, data);
 }
 
 // ------------------------------------------------------------------------------------------------
